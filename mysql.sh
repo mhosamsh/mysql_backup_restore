@@ -4,11 +4,11 @@ set -euo pipefail
 # ───────────────────────── CONFIG (overridable via env/CLI) ─────────────────────
 MYSQL_PUBLISHED_PORT="${MYSQL_PUBLISHED_PORT:-33066}"
 MYSQL_INTERNAL_PORT="${MYSQL_INTERNAL_PORT:-3306}"
-MYSQL_USER="${MYSQL_USER:-root}"
+MYSQL_USER="${MYSQL_USER:-root_user}"
 MYSQL_PASSWORD="${MYSQL_PASSWORD:-change_me_very_strong}"
 STACK_NS="${STACK_NS:-dwdm}"
 SERVICE_NAME="${SERVICE_NAME:-mysql}"
-BACKUP_ROOT="${BACKUP_ROOT:-.}"
+BACKUP_ROOT="${BACKUP_ROOT:-/root/mysql-backup/backupfiles}"
 
 # Excluded by default when using --all (or interactive option 1)
 EXCLUDE_DBS_DEFAULT="performance_db information_schema mysql sys performance_schema"
@@ -54,6 +54,8 @@ INTERACTIVE (run with no args):
   4) Quit
 
 Notes:
+- Schema files contain DDL (tables, routines, triggers, events).
+- Table files are DATA ONLY (INSERTs), no CREATE TABLE or triggers.
 - Dumps use --set-gtid-purged=OFF and --single-transaction for tables.
 - Default excludes: ${EXCLUDE_DBS_DEFAULT}
 EOF
@@ -61,14 +63,23 @@ EOF
 
 find_container() {
   local cid
-  cid=$(docker ps --filter "publish=${MYSQL_PUBLISHED_PORT}" --filter "status=running" -q)
+
+  # 1) Prefer Swarm service label (exact service)
+  cid=$(docker ps \
+    --filter "label=com.docker.swarm.service.name=${STACK_NS}_${SERVICE_NAME}" \
+    --filter "status=running" \
+    -q | head -n1)
+
+  # 2) Fallback to published port (non-swarm / custom setups)
   if [[ -z "$cid" ]]; then
-    log "⚠️  No container on port ${MYSQL_PUBLISHED_PORT}, falling back to stack/label lookup…"
+    log "⚠️  No container with service label ${STACK_NS}_${SERVICE_NAME}, falling back to port ${MYSQL_PUBLISHED_PORT}…"
     cid=$(docker ps \
-      --filter "label=com.docker.stack.namespace=${STACK_NS}" \
-      --filter "name=${SERVICE_NAME}" -q | head -n1)
+      --filter "publish=${MYSQL_PUBLISHED_PORT}" \
+      --filter "status=running" \
+      -q | head -n1)
   fi
-  [[ -n "$cid" ]] || die "Could not find any running MySQL container!"
+
+  [[ -n "$cid" ]] || die "Could not find any running MySQL container (service ${STACK_NS}_${SERVICE_NAME})!"
   echo "$cid"
 }
 
@@ -150,11 +161,16 @@ do_backup() {
   for db in "${final_dbs[@]}"; do
     log "📦 Backing up database: $db"
 
-    # schema
-    mysqldump_exec --no-data --routines --triggers --events --set-gtid-purged=OFF "$db" \
-      > "${dir}/${db}_schema.sql"
+    # SCHEMA ONLY: tables, routines, triggers, events
+    mysqldump_exec \
+      --no-data \
+      --routines \
+      --triggers \
+      --events \
+      --set-gtid-purged=OFF \
+      "$db" > "${dir}/${db}_schema.sql"
 
-    # tables
+    # DATA ONLY per table (no CREATE TABLE, no triggers)
     mapfile -t tables < <(mysql_exec -Nse "SHOW TABLES IN \`${db}\`;")
     if [[ ${#tables[@]} -eq 0 ]]; then
       $verbose && log "   (no tables)"
@@ -166,8 +182,12 @@ do_backup() {
       for tbl in "${tables[@]}"; do
         $verbose && log "   • $db.$tbl (queued)"
         (
-          mysqldump_exec --single-transaction --set-gtid-purged=OFF "$db" "$tbl" \
-            > "${dir}/${db}_${tbl}.sql"
+          mysqldump_exec \
+            --single-transaction \
+            --no-create-info \
+            --skip-triggers \
+            --set-gtid-purged=OFF \
+            "$db" "$tbl" > "${dir}/${db}_${tbl}.sql"
         ) &
         (( sem_n++ ))
         if (( sem_n >= jobs )); then
@@ -179,8 +199,12 @@ do_backup() {
     else
       for tbl in "${tables[@]}"; do
         $verbose && log "   • $db.$tbl"
-        mysqldump_exec --single-transaction --set-gtid-purged=OFF "$db" "$tbl" \
-          > "${dir}/${db}_${tbl}.sql"
+        mysqldump_exec \
+          --single-transaction \
+          --no-create-info \
+          --skip-triggers \
+          --set-gtid-purged=OFF \
+          "$db" "$tbl" > "${dir}/${db}_${tbl}.sql"
       done
     fi
   done
@@ -260,7 +284,7 @@ do_restore() {
         $verbose && log "   ⏭ (only-table) $fq"
         continue
       fi
-      if [[ -n "$SKIP_TBL_SET" ]] && fq_match "$fq" "$SKIP_TBL_SET"; then
+      if [[ -n "$SKIP_TBL_SET" ]] && fq_match "$fq" "$ONLY_TBL_SET"; then
         $verbose && log "   ⏭ (skip-table) $fq"
         continue
       fi
@@ -295,7 +319,8 @@ interactive_backup_pick_many() {
 
   # expand ranges
   expand_nums() {
-    local IFS=',' part; for part in $1; do
+    local IFS=',' part
+    for part in $1; do
       if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
         seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
       else
